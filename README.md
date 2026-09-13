@@ -1,5 +1,10 @@
 # memwatcher
 
+The price of hardware has gotten to the point where it's not cheap to replace slightly faulty hardware like memory or disk so it occurred to me, I wonder if memory has the same thing that spinning disks do where you can find a bad block of memory and then just not use it and get good reliability out of a stick of memory that has errors on it.
+
+So I had the klanker make this:
+
+
 Memwatcher is an experimental Linux kernel module and user-space daemon that
 slowly tests *physical* RAM while the machine remains online. It asks Linux to
 isolate and migrate one pageblock, maps the now-private pages into a disposable
