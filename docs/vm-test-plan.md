@@ -16,7 +16,9 @@ Do this only in a throwaway guest whose disk can be discarded.
    permission denied.
 2. Confirm an unprivileged user cannot open `/dev/memwatcher`.
 3. Confirm the scanner refuses to run without `--yes-i-understand`.
-4. Remove the module, insert it with `enabled=1`, and select one aligned
+4. Confirm `memwatcher preload --yes-i-understand` refuses the VM unless the
+   explicit `--allow-virtualized-preload` laboratory override is supplied.
+5. Remove the module, insert it with `enabled=1`, and select one aligned
    pageblock-sized PFN range from an online sysfs memory block.
 
 ## One-block smoke test

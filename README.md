@@ -20,6 +20,9 @@ pages to the allocator or retains suspect pages until reboot.
 > VM with no valuable data. Memwatcher does not replace ECC, EDAC monitoring,
 > backups, or an offline tester such as Memtest86+.
 
+The `main` branch is currently the ABI-v2 1.1.0 development line; the immutable
+1.0.0 release remains available from GitHub.
+
 ## What it does
 
 1. The daemon enumerates online physical-memory ranges from sysfs.
@@ -33,13 +36,19 @@ pages to the allocator or retains suspect pages until reboot.
    cache lines are flushed before verification by default.
 6. The mapping is removed before results are submitted. Good pages are freed;
    pages reported bad remain allocated and the module pins itself until reboot.
+7. Confirmed bad PFNs are synchronously written to a root-owned, machine-bound
+   file. On the next bare-metal boot, a oneshot service loads the module and
+   retains those pages before the scanner starts. The scanner verifies that all
+   records are quarantined and skips their pageblocks instead of retesting them.
 
 If the child crashes, is killed, loses its report, or closes the device before a
 successful completion, the module fails closed and retains the entire claim.
-The daemon writes an append-only TSV ledger after every attempt.
+The daemon writes an append-only TSV ledger after every attempt. Persistent bad
+PFNs live separately in `/var/lib/memwatcher/bad-pages.tsv`.
 
 See [the architecture](docs/architecture.md), [the threat model](SECURITY.md),
-and [the VM test plan](docs/vm-test-plan.md) before enabling it.
+the [persistent quarantine design](docs/persistent-quarantine.md), and
+[the VM test plan](docs/vm-test-plan.md) before enabling it.
 
 ## Requirements and compatibility
 
@@ -54,6 +63,12 @@ The kernel must be able to migrate every page in a candidate pageblock. Kernel
 allocations, pinned DMA pages, some huge pages, device memory, reserved ranges,
 and other unmovable contents are intentionally skipped. Consequently, an online
 sweep cannot promise 100% coverage.
+
+Persistent PFN preload is for bare metal only. In a VM, a guest PFN may receive
+different host backing after reboot, ballooning, migration, or swapping. In a
+container, PFNs belong to the shared host kernel rather than the container.
+Automatic preload therefore refuses both environments unless explicitly
+overridden; that override is intended only for specialized testing.
 
 ## Build and non-destructive checks
 
@@ -99,20 +114,25 @@ until the next reboot. Quarantine state is not persistent across reboot.
 
 ```sh
 sudo make install
-sudo modprobe memwatcher enabled=1
 sudo systemctl enable --now memwatcher.service
 ```
 
-Installing does not load or enable the module. The systemd service starts only
-when `/dev/memwatcher` exists. Review its command line before enabling it. DKMS
-metadata is included, but distro-specific DKMS registration is left to package
-maintainers.
+Installing does not immediately load or enable the module. Starting the service
+on bare metal runs `memwatcher-preload.service`: it loads the module with
+`enabled=1`, restores known-bad PFNs, and only then permits the scanner to start.
+If any known-bad pageblock cannot be acquired, preload fails and the scanner is
+not started. In a VM or container the automatic preload unit is skipped; load
+the module manually if you intentionally want a non-persistent guest scan.
+
+DKMS metadata is included, but distro-specific DKMS registration is left to
+package maintainers.
 
 ## Commands
 
 ```text
 memwatcher info
 memwatcher selftest [--quick] [--no-cache-flush] [--mib N]
+memwatcher preload --yes-i-understand [--bad-pages PATH]
 memwatcher scan --yes-i-understand [--forever] [--passes N]
                 [--interval SECONDS] [--quick]
                 [--start-pfn PFN --end-pfn PFN]
@@ -120,6 +140,12 @@ memwatcher scan --yes-i-understand [--forever] [--passes N]
 
 Run `memwatcher --help` for the complete option list. `--no-cache-flush` allows
 non-x86 testing, but may verify cache rather than DRAM and is therefore weaker.
+
+The persistent file rejects symlinks, files owned by another UID, group/world
+writable files, malformed records, excessive size, and a machine ID different
+from the current installation. Its updates are flushed to both the file and
+parent directory before scanning continues. Copying the file to another machine
+is intentionally not supported.
 
 ## Design lineage
 

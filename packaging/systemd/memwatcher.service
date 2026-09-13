@@ -2,7 +2,8 @@
 Description=Slow continuous online physical memory test
 Documentation=https://github.com/xorxand/memwatcher
 ConditionPathExists=/dev/memwatcher
-After=multi-user.target
+Requires=memwatcher-preload.service
+After=memwatcher-preload.service
 
 [Service]
 Type=simple

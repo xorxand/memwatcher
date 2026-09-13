@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Persist confirmed bad PFNs in a secure, machine-bound file and preload them
+  into volatile kernel quarantine before the scanner starts on bare metal.
+- Refuse automatic persistent-PFN replay in VMs and containers, where guest PFNs
+  do not identify stable hardware pages.
+- Split completed-test and preloaded-page accounting in ioctl ABI version 2.
+
 ## 1.0.0 - 2026-09-13
 
 - Initial research-quality release.

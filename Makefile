@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-VERSION := 1.0.0
+VERSION := 1.1.0-dev
 CC ?= cc
 CFLAGS ?= -O2 -g
 CPPFLAGS += -Iinclude -Isrc
@@ -17,13 +17,13 @@ all: userspace module
 
 userspace: build/memwatcher
 
-build/memwatcher: src/main.c src/memtest.c src/memtest.h include/memwatcher_uapi.h
+build/memwatcher: src/main.c src/memtest.c src/memtest.h src/badpages.c src/badpages.h include/memwatcher_uapi.h
 	@mkdir -p build
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ src/main.c src/memtest.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ src/main.c src/memtest.c src/badpages.c
 
-build/memtest_test: tests/memtest_test.c src/memtest.c src/memtest.h include/memwatcher_uapi.h
+build/memtest_test: tests/memtest_test.c src/memtest.c src/memtest.h src/badpages.c src/badpages.h include/memwatcher_uapi.h
 	@mkdir -p build
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tests/memtest_test.c src/memtest.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tests/memtest_test.c src/memtest.c src/badpages.c
 
 module:
 	$(MAKE) -C $(KDIR) M=$(CURDIR)/kernel \
@@ -35,11 +35,13 @@ test: build/memtest_test build/memwatcher
 	./build/memtest_test
 	./build/memwatcher selftest --quick --mib 2
 	./build/memwatcher scan --dry-run --interval 10
+	@./build/memwatcher preload >/dev/null 2>&1; test $$? -eq 2
 
 install: all
 	install -D -m 0755 build/memwatcher $(DESTDIR)$(PREFIX)/sbin/memwatcher
 	install -D -m 0644 kernel/memwatcher.ko $(DESTDIR)/lib/modules/$(shell uname -r)/extra/memwatcher.ko
 	install -D -m 0644 packaging/systemd/memwatcher.service $(DESTDIR)/lib/systemd/system/memwatcher.service
+	install -D -m 0644 packaging/systemd/memwatcher-preload.service $(DESTDIR)/lib/systemd/system/memwatcher-preload.service
 	install -D -m 0644 packaging/memwatcher.8 $(DESTDIR)$(PREFIX)/share/man/man8/memwatcher.8
 	@if [ -z "$(DESTDIR)" ]; then depmod -a; fi
 
@@ -47,6 +49,7 @@ uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/sbin/memwatcher
 	rm -f $(DESTDIR)/lib/modules/$(shell uname -r)/extra/memwatcher.ko
 	rm -f $(DESTDIR)/lib/systemd/system/memwatcher.service
+	rm -f $(DESTDIR)/lib/systemd/system/memwatcher-preload.service
 	rm -f $(DESTDIR)$(PREFIX)/share/man/man8/memwatcher.8
 	@if [ -z "$(DESTDIR)" ]; then depmod -a; fi
 

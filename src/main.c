@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #define _GNU_SOURCE
+#include "badpages.h"
 #include "memtest.h"
 
 #include <dirent.h>
@@ -26,9 +27,14 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "1.0.0"
+#if defined(__x86_64__) || defined(__i386__)
+#include <cpuid.h>
+#endif
+
+#define VERSION "1.1.0-dev"
 #define DEFAULT_INTERVAL 10.0
 #define DEFAULT_STATE "/var/lib/memwatcher/state.tsv"
+#define DEFAULT_BAD_PAGES "/var/lib/memwatcher/bad-pages.tsv"
 
 struct range { uint64_t start_pfn, end_pfn; };
 struct ranges { struct range *items; size_t count, capacity; };
@@ -56,11 +62,13 @@ static void usage(FILE *out)
 		"Usage:\n"
 		"  memwatcher info [--device PATH]\n"
 		"  memwatcher selftest [--quick] [--no-cache-flush] [--mib N]\n"
+		"  memwatcher preload --yes-i-understand [--bad-pages PATH]\n"
 		"  memwatcher scan [options]\n\n"
 		"Scan options:\n"
 		"  --yes-i-understand    required acknowledgement for destructive tests\n"
 		"  --device PATH         device node (default %s)\n"
 		"  --state PATH          append-only ledger (default %s)\n"
+		"  --bad-pages PATH      durable bad-PFN file (default %s)\n"
 		"  --interval SECONDS    delay between pageblocks (default %.0f)\n"
 		"  --passes N            sweeps to attempt (default 1)\n"
 		"  --forever             repeat sweeps until stopped\n"
@@ -68,8 +76,11 @@ static void usage(FILE *out)
 		"  --end-pfn PFN         restrict end PFN, exclusive\n"
 		"  --quick               reduced pattern set\n"
 		"  --no-cache-flush      permit cache-resident test (not recommended)\n"
-		"  --dry-run             enumerate without opening the device\n",
-		VERSION, MW_DEVICE_PATH, DEFAULT_STATE, DEFAULT_INTERVAL);
+		"  --dry-run             enumerate without opening the device\n"
+		"  --allow-virtualized-preload\n"
+		"                        override VM/container preload refusal\n",
+		VERSION, MW_DEVICE_PATH, DEFAULT_STATE, DEFAULT_BAD_PAGES,
+		DEFAULT_INTERVAL);
 }
 
 static uint64_t monotonic_ns(void)
@@ -201,7 +212,9 @@ static int discover_ranges(struct ranges *ranges, size_t page_size)
 		}
 	}
 	closedir(directory);
-	qsort(ranges->items, ranges->count, sizeof(*ranges->items), compare_ranges);
+	if (ranges->count)
+		qsort(ranges->items, ranges->count, sizeof(*ranges->items),
+		      compare_ranges);
 	return ranges->count ? 0 : -1;
 }
 
@@ -256,15 +269,17 @@ static int command_info(const char *device)
 		return 1;
 	}
 	printf("ABI: %u\npage size: %u bytes\npageblock: %u pages (%llu bytes)\n"
-	       "claims: %llu successful, %llu failed\ntested: %llu pages\n"
-	       "quarantined: %llu pages (%llu without metadata)\n",
+	       "claims: %llu successful, %llu failed\ncompleted tests: %llu pages\n"
+	       "quarantined: %llu pages (%llu without metadata)\n"
+	       "preloaded known-bad: %llu pages\n",
 	       info.abi_version, info.page_size, info.pageblock_pages,
 	       (unsigned long long)info.page_size * info.pageblock_pages,
 	       (unsigned long long)info.successful_claims,
 	       (unsigned long long)info.failed_claims,
 	       (unsigned long long)info.tested_pages,
 	       (unsigned long long)info.quarantined_pages,
-	       (unsigned long long)info.orphaned_quarantine_pages);
+	       (unsigned long long)info.orphaned_quarantine_pages,
+	       (unsigned long long)info.preloaded_pages);
 	print_quarantines(fd, &info);
 	close(fd);
 	return 0;
@@ -372,7 +387,8 @@ static int test_one_block(const char *device, const struct mw_info *info,
 		return -1;
 	}
 	if (report->test_status < 0) {
-		report->result.flags |= MW_RESULT_F_QUARANTINE_ALL;
+		report->result.flags |= MW_RESULT_F_QUARANTINE_ALL |
+					MW_RESULT_F_INCOMPLETE;
 		report->error = -report->test_status;
 	}
 	ret = ioctl(fd, MW_IOC_COMPLETE, &report->result);
@@ -481,16 +497,212 @@ static void sleep_interval(double seconds)
 static volatile sig_atomic_t stop_requested;
 static void request_stop(int sig) { (void)sig; stop_requested = 1; }
 
+static bool text_file_contains(const char *path, const char *needle)
+{
+	char buffer[4096];
+	FILE *file = fopen(path, "re");
+	size_t got;
+
+	if (!file)
+		return false;
+	got = fread(buffer, 1, sizeof(buffer) - 1, file);
+	fclose(file);
+	buffer[got] = '\0';
+	return got && (!needle || strstr(buffer, needle));
+}
+
+static bool virtualized_or_containerized(void)
+{
+	const char *container = getenv("container");
+
+	if ((container && *container) || access("/.dockerenv", F_OK) == 0 ||
+	    text_file_contains("/run/systemd/container", NULL) ||
+	    text_file_contains("/sys/hypervisor/type", NULL) ||
+	    text_file_contains("/proc/1/cgroup", "docker") ||
+	    text_file_contains("/proc/1/cgroup", "lxc") ||
+	    text_file_contains("/proc/1/cgroup", "kubepods") ||
+	    text_file_contains("/proc/1/cgroup", "containerd"))
+		return true;
+#if defined(__x86_64__) || defined(__i386__)
+	{
+		unsigned int eax, ebx, ecx, edx;
+
+		if (__get_cpuid(1, &eax, &ebx, &ecx, &edx) && (ecx & (1U << 31)))
+			return true;
+	}
+#endif
+	return false;
+}
+
+static bool database_intersects(const struct mw_bad_page_db *database,
+				uint64_t start, uint64_t nr_pages)
+{
+	size_t low = 0, high = database->count;
+
+	while (low < high) {
+		size_t middle = low + (high - low) / 2;
+
+		if (database->pfns[middle] < start)
+			low = middle + 1;
+		else
+			high = middle;
+	}
+	return low < database->count && database->pfns[low] - start < nr_pages;
+}
+
+static bool kernel_has_all_bad_pfns(int fd, const struct mw_info *info,
+				    const struct mw_bad_page_db *database)
+{
+	uint64_t index, queryable, matched = 0;
+
+	if (!database->count)
+		return true;
+	queryable = info->quarantined_pages - info->orphaned_quarantine_pages;
+	for (index = 0; index < queryable; index++) {
+		struct mw_quarantine_query query = { .index = index };
+
+		if (ioctl(fd, MW_IOC_GET_QUARANTINE, &query))
+			return false;
+		if (mw_bad_pages_contains(database, query.pfn))
+			matched++;
+	}
+	return matched == database->count;
+}
+
+static int persist_bad_result(const char *path, uint64_t start_pfn,
+			      const struct mw_info *info,
+			      const struct child_report *report,
+			      struct mw_bad_page_db *database)
+{
+	uint64_t *pfns;
+	size_t count, i;
+	int ret;
+
+	if (report->stage != CHILD_COMPLETED || report->test_status <= 0 ||
+	    !report->result.bad_count)
+		return 0;
+	count = report->result.flags & MW_RESULT_F_QUARANTINE_ALL ?
+		info->pageblock_pages : report->result.bad_count;
+	pfns = calloc(count, sizeof(*pfns));
+	if (!pfns)
+		return -1;
+	if (report->result.flags & MW_RESULT_F_QUARANTINE_ALL) {
+		for (i = 0; i < count; i++)
+			pfns[i] = start_pfn + i;
+	} else {
+		for (i = 0; i < count; i++)
+			pfns[i] = start_pfn + report->result.bad_page_offsets[i];
+	}
+	ret = mw_bad_pages_append(path, pfns, count);
+	free(pfns);
+	if (!ret) {
+		mw_bad_pages_free(database);
+		ret = mw_bad_pages_load(path, database);
+	}
+	return ret;
+}
+
+static int command_preload(const char *device, const char *bad_pages,
+			   bool acknowledged, bool allow_virtualized)
+{
+	struct mw_bad_page_db database;
+	struct mw_info info;
+	size_t index = 0;
+	uint64_t retained = 0, failed = 0;
+	int fd;
+
+	if (!acknowledged) {
+		fprintf(stderr, "refusing preload without --yes-i-understand\n");
+		return 2;
+	}
+	if (!allow_virtualized && virtualized_or_containerized()) {
+		fprintf(stderr, "refusing persistent PFN preload in a VM/container; "
+			"guest PFNs are not stable hardware identities\n");
+		return 2;
+	}
+	if (mw_bad_pages_load(bad_pages, &database)) {
+		fprintf(stderr, "cannot load %s: %s\n", bad_pages, strerror(errno));
+		return 1;
+	}
+	if (!database.count) {
+		printf("no persisted bad PFNs to preload\n");
+		mw_bad_pages_free(&database);
+		return 0;
+	}
+	fd = open_device(device);
+	if (fd < 0 || get_info_fd(fd, &info)) {
+		if (fd >= 0) {
+			perror("MW_IOC_GET_INFO");
+			close(fd);
+		}
+		mw_bad_pages_free(&database);
+		return 1;
+	}
+	close(fd);
+
+	while (index < database.count) {
+		struct mw_claim claim;
+		struct mw_result result = { .flags = MW_RESULT_F_PRELOAD };
+		uint64_t block = database.pfns[index] -
+			database.pfns[index] % info.pageblock_pages;
+		size_t end = index;
+
+		while (end < database.count &&
+		       database.pfns[end] - database.pfns[end] %
+		       info.pageblock_pages == block)
+			end++;
+		claim = (struct mw_claim){
+			.start_pfn = block,
+			.nr_pages = info.pageblock_pages,
+		};
+		if (end - index > MW_MAX_BAD_PAGES) {
+			result.flags |= MW_RESULT_F_QUARANTINE_ALL;
+		} else {
+			size_t cursor;
+
+			result.bad_count = (uint32_t)(end - index);
+			for (cursor = index; cursor < end; cursor++)
+				result.bad_page_offsets[cursor - index] =
+					(uint32_t)(database.pfns[cursor] - block);
+		}
+
+		fd = open_device(device);
+		if (fd < 0 || ioctl(fd, MW_IOC_CLAIM, &claim) ||
+		    ioctl(fd, MW_IOC_COMPLETE, &result)) {
+			int saved_errno = errno;
+
+			if (fd >= 0)
+				close(fd); /* fail closed if the claim was acquired */
+			fprintf(stderr, "cannot preload pageblock 0x%llx: %s\n",
+				(unsigned long long)block, strerror(saved_errno));
+			failed += end - index;
+		} else {
+			close(fd);
+			retained += result.flags & MW_RESULT_F_QUARANTINE_ALL ?
+				info.pageblock_pages : end - index;
+		}
+		index = end;
+	}
+	printf("preload: %llu pages retained, %llu known PFNs failed\n",
+	       (unsigned long long)retained, (unsigned long long)failed);
+	mw_bad_pages_free(&database);
+	return failed ? 1 : 0;
+}
+
 static int command_scan(const char *device, const char *state, double interval,
 			uint64_t passes, bool forever, bool quick,
 			bool flush_cache, bool dry_run, bool acknowledged,
-			bool restricted, uint64_t restrict_start, uint64_t restrict_end)
+			bool restricted, uint64_t restrict_start, uint64_t restrict_end,
+			const char *bad_pages)
 {
 	struct ranges ranges = { 0 };
+	struct mw_bad_page_db known_bad = { 0 };
 	struct mw_info info;
 	FILE *ledger = NULL;
-	uint64_t pass, candidates = 0;
+	uint64_t pass, candidates = 0, known_bad_blocks = 0;
 	int fd = -1, rc = 1;
+	bool persistence_failed = false;
+	bool persistence_enabled = !virtualized_or_containerized();
 	size_t i;
 
 	if (!dry_run && !acknowledged) {
@@ -503,6 +715,19 @@ static int command_scan(const char *device, const char *state, double interval,
 			if (fd >= 0) perror("MW_IOC_GET_INFO");
 			goto out;
 		}
+		if (persistence_enabled && mw_bad_pages_load(bad_pages, &known_bad)) {
+			fprintf(stderr, "cannot validate %s: %s\n", bad_pages,
+				strerror(errno));
+			goto out;
+		}
+		if (persistence_enabled &&
+		    !kernel_has_all_bad_pfns(fd, &info, &known_bad)) {
+			fprintf(stderr, "persisted bad PFNs are not all quarantined; "
+				"run preload before scanning\n");
+			goto out;
+		}
+		if (!persistence_enabled)
+			fprintf(stderr, "VM/container detected: persistent PFN recording is disabled\n");
 		close(fd); fd = -1;
 	} else {
 		info.page_size = (uint32_t)sysconf(_SC_PAGESIZE);
@@ -524,10 +749,20 @@ static int command_scan(const char *device, const char *state, double interval,
 		if (ranges.items[i].end_pfn > pfn)
 			candidates += (ranges.items[i].end_pfn - pfn) /
 				      info.pageblock_pages;
+		for (; persistence_enabled &&
+		       pfn <= ranges.items[i].end_pfn &&
+		       ranges.items[i].end_pfn - pfn >= info.pageblock_pages;
+		     pfn += info.pageblock_pages)
+			if (database_intersects(&known_bad, pfn,
+						info.pageblock_pages))
+				known_bad_blocks++;
 	}
 	printf("%llu candidate pageblocks, %u pages each; theoretical sweep %.2f days\n",
 	       (unsigned long long)candidates, info.pageblock_pages,
 	       candidates * interval / 86400.0);
+	if (known_bad_blocks)
+		printf("%llu pageblocks contain quarantined known-bad PFNs and will be skipped\n",
+		       (unsigned long long)known_bad_blocks);
 	if (dry_run) { rc = 0; goto out; }
 	ledger = open_ledger(state);
 	if (!ledger) { perror("open state ledger"); goto out; }
@@ -548,8 +783,22 @@ static int command_scan(const char *device, const char *state, double interval,
 			       ranges.items[i].end_pfn - pfn >= info.pageblock_pages &&
 			       !stop_requested; pfn += info.pageblock_pages) {
 				struct child_report report;
+
+				if (persistence_enabled &&
+				    database_intersects(&known_bad, pfn,
+							info.pageblock_pages))
+					continue;
+
 				int sig, child_rc = run_child(device, &info, pfn, quick,
 							flush_cache, &report, &sig);
+				if (persistence_enabled &&
+				    persist_bad_result(bad_pages, pfn, &info, &report,
+						       &known_bad)) {
+					fprintf(stderr, "cannot persist bad PFNs to %s: %s; stopping scan\n",
+						bad_pages, strerror(errno));
+					stop_requested = 1;
+					persistence_failed = true;
+				}
 				log_result(ledger, pfn, &info, &report, child_rc, sig);
 				if (sig)
 					fprintf(stderr, "pfn 0x%llx: tester died on signal %d; claim quarantined\n",
@@ -564,10 +813,11 @@ static int command_scan(const char *device, const char *state, double interval,
 			}
 		}
 	}
-	rc = 0;
+	rc = persistence_failed ? 1 : 0;
 out:
 	if (ledger) fclose(ledger);
 	if (fd >= 0) close(fd);
+	mw_bad_pages_free(&known_bad);
 	free(ranges.items);
 	return rc;
 }
@@ -575,14 +825,17 @@ out:
 int main(int argc, char **argv)
 {
 	const char *command, *device = MW_DEVICE_PATH, *state = DEFAULT_STATE;
+	const char *bad_pages = DEFAULT_BAD_PAGES;
 	double interval = DEFAULT_INTERVAL;
 	uint64_t passes = 1, start = 0, end = 0, mib = 16;
 	bool forever = false, quick = false, flush_cache = true, dry_run = false;
 	bool acknowledged = false, have_start = false, have_end = false;
+	bool allow_virtualized_preload = false;
 	int option;
 	static const struct option options[] = {
 		{ "device", required_argument, NULL, 'd' },
 		{ "state", required_argument, NULL, 's' },
+		{ "bad-pages", required_argument, NULL, 1003 },
 		{ "interval", required_argument, NULL, 'i' },
 		{ "passes", required_argument, NULL, 'p' },
 		{ "forever", no_argument, NULL, 'f' },
@@ -590,6 +843,7 @@ int main(int argc, char **argv)
 		{ "end-pfn", required_argument, NULL, 1001 },
 		{ "quick", no_argument, NULL, 'q' },
 		{ "no-cache-flush", no_argument, NULL, 1002 },
+		{ "allow-virtualized-preload", no_argument, NULL, 1004 },
 		{ "dry-run", no_argument, NULL, 'n' },
 		{ "yes-i-understand", no_argument, NULL, 'y' },
 		{ "mib", required_argument, NULL, 'm' },
@@ -623,6 +877,8 @@ int main(int argc, char **argv)
 		case 1000: if (parse_u64(optarg, &start)) return 2; have_start = true; break;
 		case 1001: if (parse_u64(optarg, &end)) return 2; have_end = true; break;
 		case 1002: flush_cache = false; break;
+		case 1003: bad_pages = optarg; break;
+		case 1004: allow_virtualized_preload = true; break;
 		case 'V': puts(VERSION); return 0;
 		case 'h': usage(stdout); return 0;
 		default: return 2;
@@ -632,6 +888,9 @@ int main(int argc, char **argv)
 		return command_info(device);
 	if (!strcmp(command, "selftest"))
 		return command_selftest(quick, flush_cache, mib);
+	if (!strcmp(command, "preload"))
+		return command_preload(device, bad_pages, acknowledged,
+				       allow_virtualized_preload);
 	if (!strcmp(command, "scan")) {
 		if (have_start != have_end) {
 			fprintf(stderr, "--start-pfn and --end-pfn must be used together\n");
@@ -639,7 +898,7 @@ int main(int argc, char **argv)
 		}
 		return command_scan(device, state, interval, passes, forever, quick,
 				    flush_cache, dry_run, acknowledged, have_start,
-				    start, end);
+				    start, end, bad_pages);
 	}
 	usage(stderr);
 	return 2;

@@ -5,7 +5,7 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define MW_ABI_VERSION 1U
+#define MW_ABI_VERSION 2U
 #define MW_MAX_BAD_PAGES 64U
 #define MW_DEVICE_PATH "/dev/memwatcher"
 
@@ -19,6 +19,7 @@ struct mw_info {
 	__u64 tested_pages;
 	__u64 quarantined_pages;
 	__u64 orphaned_quarantine_pages;
+	__u64 preloaded_pages;
 };
 
 struct mw_claim {
@@ -28,6 +29,8 @@ struct mw_claim {
 };
 
 #define MW_RESULT_F_QUARANTINE_ALL (1U << 0)
+#define MW_RESULT_F_PRELOAD        (1U << 1)
+#define MW_RESULT_F_INCOMPLETE     (1U << 2)
 
 struct mw_result {
 	__u32 bad_count;
@@ -42,6 +45,8 @@ struct mw_result {
 
 #define MW_QUARANTINE_F_WHOLE_CLAIM (1U << 0)
 #define MW_QUARANTINE_F_ABANDONED   (1U << 1)
+#define MW_QUARANTINE_F_PRELOADED   (1U << 2)
+#define MW_QUARANTINE_F_INCOMPLETE  (1U << 3)
 
 struct mw_quarantine_query {
 	__u64 index;

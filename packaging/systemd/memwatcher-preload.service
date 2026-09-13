@@ -1,0 +1,26 @@
+[Unit]
+Description=Load Memwatcher and retain persisted bad physical pages
+Documentation=https://github.com/xorxand/memwatcher
+Before=memwatcher.service
+After=local-fs.target
+ConditionVirtualization=false
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/modprobe memwatcher enabled=1
+ExecStart=/usr/sbin/memwatcher preload --yes-i-understand
+RemainAfterExit=yes
+UMask=0077
+StateDirectory=memwatcher
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=CAP_SYS_MODULE CAP_SYS_RAWIO

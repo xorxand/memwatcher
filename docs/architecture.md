@@ -27,7 +27,9 @@ online-memory sysfs              /dev/memwatcher
         |                         |  complete(good/bad bitmap)
         |                         v
         +<-- shared report -- kernel frees good pages
-        |                     and retains suspect pages
+        |        |            and retains suspect pages
+        |        v
+        |   durable bad-PFN set
         v
  append-only TSV ledger
 ```
@@ -118,8 +120,33 @@ their individual PFNs may no longer be queryable.
 - `QUARANTINE`: explicitly abandon the whole claim; and
 - `GET_QUARANTINE`: enumerate retained PFNs.
 
-The ABI version is 1. Kernel build assertions protect record sizes across 32-
-and 64-bit callers.
+The ABI version is 2. A preload flag lets the kernel reject a supposed preload
+after any mapping occurred, and separate counters distinguish completed tests
+from restored known-bad pages. An incomplete-test flag prevents crash/error
+quarantine from inflating completed coverage. Kernel build assertions protect
+record sizes across 32- and 64-bit callers.
+
+## Persistent quarantine
+
+Only completed tests with actual mismatches enter the durable bad-PFN set.
+Crash, protocol, and internal-test-error quarantines remain fail-closed for the
+current boot but are not labeled as defective hardware for future boots. If the
+mismatch report overflows its bounded list, the entire pageblock is persisted.
+
+At the next bare-metal service start, a separate oneshot unit loads the module,
+groups recorded PFNs by pageblock, claims each block without mapping it, retains
+the known-bad offsets, and frees the remaining pages. A failure to reacquire any
+recorded page causes preload to fail, which prevents the scanner service from
+starting and makes the loss of protection visible.
+
+The file is tied to `/etc/machine-id` and securely validated. This reduces
+accidental replay from a copied state file, but cloned installations can share a
+machine ID. It is not a DIMM serial-number database; moving a disk or changing
+memory hardware can invalidate the physical-address assumption.
+
+Automatic preload is conditioned on bare metal. Guest PFNs do not stably name
+host pages across a VM lifecycle, and a container shares host PFNs without a
+container-specific physical boundary.
 
 ## Coverage and scheduling
 
@@ -148,13 +175,14 @@ and therefore makes no bounded-coverage or performance guarantee.
 
 ## Known gaps
 
-- No destructive VM integration result is claimed for 1.0.0.
+- No destructive VM integration result is claimed for the current code.
 - No ARM cache-maintenance implementation; non-x86 requires the weaker opt-out.
 - No NUMA-aware ordering or adaptive rate control.
-- No persistent bad-PFN boot parameter generation.
+- Persistent quarantine starts after local filesystems become available; it is
+  not yet an initramfs-stage reservation.
 - No EDAC/RAS event correlation or hardware error injection harness.
 - No testing of pages that remain unmovable for an entire sweep.
 - No stable-kernel compatibility promise beyond the compiled 6.8 target.
 
-These are reasons to treat 1.0.0 as a research-quality baseline, not production
+These are reasons to treat Memwatcher as a research-quality baseline, not production
 fault containment.

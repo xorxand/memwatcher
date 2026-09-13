@@ -32,6 +32,7 @@ struct mw_session {
 	unsigned long nr_pages;
 	atomic_t mappings;
 	bool claimed;
+	bool mapped_once;
 };
 
 struct mw_quarantine {
@@ -54,6 +55,7 @@ static atomic64_t mw_failed_claims;
 static atomic64_t mw_tested_pages;
 static atomic64_t mw_quarantined_pages;
 static atomic64_t mw_orphaned_pages;
+static atomic64_t mw_preloaded_pages;
 
 static bool enabled;
 module_param(enabled, bool, 0600);
@@ -108,7 +110,8 @@ static void mw_pin_for_quarantine(void)
 /* Caller holds session->lock and has verified there are no VMAs. */
 static int mw_finish_claim(struct mw_session *session,
 			   const unsigned long *bad_bitmap,
-			   unsigned long qflags, bool allow_alloc_failure)
+			   unsigned long qflags, bool allow_alloc_failure,
+			   bool count_as_test, bool count_as_preload)
 {
 	struct mw_quarantine *q = NULL;
 	unsigned long pfn, bad_count = 0;
@@ -143,7 +146,10 @@ static int mw_finish_claim(struct mw_session *session,
 	else if (bad_count)
 		atomic64_add(bad_count, &mw_orphaned_pages);
 	atomic64_add(bad_count, &mw_quarantined_pages);
-	atomic64_add(session->nr_pages, &mw_tested_pages);
+	if (count_as_test)
+		atomic64_add(session->nr_pages, &mw_tested_pages);
+	if (count_as_preload)
+		atomic64_add(bad_count, &mw_preloaded_pages);
 	if (mw_active_claims)
 		mw_active_claims--;
 	mutex_unlock(&mw_global_lock);
@@ -151,11 +157,13 @@ static int mw_finish_claim(struct mw_session *session,
 	session->claimed = false;
 	session->start_pfn = 0;
 	session->nr_pages = 0;
+	session->mapped_once = false;
 	return 0;
 }
 
 static int mw_quarantine_all(struct mw_session *session, unsigned long flags,
-			     bool allow_alloc_failure)
+			     bool allow_alloc_failure, bool count_as_test,
+			     bool count_as_preload)
 {
 	unsigned long *bad;
 	int ret;
@@ -168,17 +176,24 @@ static int mw_quarantine_all(struct mw_session *session, unsigned long flags,
 		mutex_lock(&mw_global_lock);
 		atomic64_add(session->nr_pages, &mw_quarantined_pages);
 		atomic64_add(session->nr_pages, &mw_orphaned_pages);
-		atomic64_add(session->nr_pages, &mw_tested_pages);
+		if (count_as_test)
+			atomic64_add(session->nr_pages, &mw_tested_pages);
+		if (count_as_preload)
+			atomic64_add(session->nr_pages, &mw_preloaded_pages);
 		if (mw_active_claims)
 			mw_active_claims--;
 		mutex_unlock(&mw_global_lock);
 		session->claimed = false;
+		session->start_pfn = 0;
+		session->nr_pages = 0;
+		session->mapped_once = false;
 		return 0;
 	}
 
 	bitmap_fill(bad, session->nr_pages);
 	ret = mw_finish_claim(session, bad, flags | MW_QUARANTINE_F_WHOLE_CLAIM,
-			      allow_alloc_failure);
+			      allow_alloc_failure, count_as_test,
+			      count_as_preload);
 	bitmap_free(bad);
 	return ret;
 }
@@ -195,6 +210,7 @@ static long mw_get_info(void __user *arg)
 		.tested_pages = atomic64_read(&mw_tested_pages),
 		.quarantined_pages = atomic64_read(&mw_quarantined_pages),
 		.orphaned_quarantine_pages = atomic64_read(&mw_orphaned_pages),
+		.preloaded_pages = atomic64_read(&mw_preloaded_pages),
 	};
 
 	return copy_to_user(arg, &info, sizeof(info)) ? -EFAULT : 0;
@@ -243,6 +259,7 @@ static long mw_claim(struct mw_session *session, void __user *arg)
 	session->start_pfn = start;
 	session->nr_pages = nr;
 	session->claimed = true;
+	session->mapped_once = false;
 	atomic64_inc(&mw_successful_claims);
 	mutex_unlock(&session->lock);
 	return 0;
@@ -261,12 +278,15 @@ static long mw_complete(struct mw_session *session, void __user *arg)
 {
 	struct mw_result result;
 	unsigned long *bad = NULL;
+	unsigned long quarantine_flags;
 	unsigned int i;
+	bool count_as_preload, count_as_test;
 	int ret = 0;
 
 	if (copy_from_user(&result, arg, sizeof(result)))
 		return -EFAULT;
-	if (result.flags & ~MW_RESULT_F_QUARANTINE_ALL)
+	if (result.flags & ~(MW_RESULT_F_QUARANTINE_ALL |
+			     MW_RESULT_F_PRELOAD | MW_RESULT_F_INCOMPLETE))
 		return -EINVAL;
 
 	mutex_lock(&session->lock);
@@ -278,9 +298,22 @@ static long mw_complete(struct mw_session *session, void __user *arg)
 		ret = -EBUSY;
 		goto out;
 	}
+	count_as_preload = result.flags & MW_RESULT_F_PRELOAD;
+	count_as_test = !(result.flags & (MW_RESULT_F_PRELOAD |
+					 MW_RESULT_F_INCOMPLETE));
+	quarantine_flags = count_as_preload ? MW_QUARANTINE_F_PRELOADED : 0;
+	if (result.flags & MW_RESULT_F_INCOMPLETE)
+		quarantine_flags |= MW_QUARANTINE_F_INCOMPLETE;
+	if ((count_as_preload && session->mapped_once) ||
+	    ((result.flags & MW_RESULT_F_INCOMPLETE) &&
+	     (!(result.flags & MW_RESULT_F_QUARANTINE_ALL) || count_as_preload))) {
+		ret = -EINVAL;
+		goto out;
+	}
 
 	if (result.flags & MW_RESULT_F_QUARANTINE_ALL) {
-		ret = mw_quarantine_all(session, 0, false);
+		ret = mw_quarantine_all(session, quarantine_flags, false, count_as_test,
+					count_as_preload);
 		goto out;
 	}
 	if (result.bad_count > MW_MAX_BAD_PAGES) {
@@ -288,7 +321,12 @@ static long mw_complete(struct mw_session *session, void __user *arg)
 		goto out;
 	}
 	if (!result.bad_count) {
-		ret = mw_finish_claim(session, NULL, 0, false);
+		if (count_as_preload) {
+			ret = -EINVAL;
+			goto out;
+		}
+		ret = mw_finish_claim(session, NULL, 0, false, count_as_test,
+				      false);
 		goto out;
 	}
 
@@ -305,7 +343,8 @@ static long mw_complete(struct mw_session *session, void __user *arg)
 			goto out;
 		}
 	}
-	ret = mw_finish_claim(session, bad, 0, false);
+	ret = mw_finish_claim(session, bad, quarantine_flags, false, count_as_test,
+			      count_as_preload);
 out:
 	bitmap_free(bad);
 	mutex_unlock(&session->lock);
@@ -365,7 +404,7 @@ static long mw_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			ret = -EBUSY;
 		else
 			ret = mw_quarantine_all(session, MW_QUARANTINE_F_ABANDONED,
-						true);
+						true, false, false);
 		mutex_unlock(&session->lock);
 		return ret;
 	case MW_IOC_GET_QUARANTINE:
@@ -419,6 +458,8 @@ static int mw_mmap(struct file *file, struct vm_area_struct *vma)
 	ret = remap_pfn_range(vma, vma->vm_start, session->start_pfn,
 			      length, vma->vm_page_prot);
 	if (!ret)
+		session->mapped_once = true;
+	if (!ret)
 		mw_vma_open(vma);
 out:
 	mutex_unlock(&session->lock);
@@ -451,7 +492,8 @@ static int mw_release(struct inode *inode, struct file *file)
 
 	mutex_lock(&session->lock);
 	if (session->claimed)
-		mw_quarantine_all(session, MW_QUARANTINE_F_ABANDONED, true);
+		mw_quarantine_all(session, MW_QUARANTINE_F_ABANDONED, true,
+				  false, false);
 	mutex_unlock(&session->lock);
 	kfree(session);
 	atomic_set(&mw_opened, 0);
@@ -532,7 +574,7 @@ static int __init mw_init(void)
 {
 	int ret;
 
-	BUILD_BUG_ON(sizeof(struct mw_info) != 56);
+	BUILD_BUG_ON(sizeof(struct mw_info) != 64);
 	BUILD_BUG_ON(sizeof(struct mw_claim) != 16);
 	BUILD_BUG_ON(sizeof(struct mw_result) != 296);
 	BUILD_BUG_ON(sizeof(struct mw_quarantine_query) != 24);
@@ -550,7 +592,7 @@ static int __init mw_init(void)
 	if (ret)
 		goto unregister_pm;
 
-	pr_info("memwatcher 1.0.0 loaded (enabled=%d, pageblock=%lu pages)\n",
+	pr_info("memwatcher 1.1.0-dev loaded (enabled=%d, pageblock=%lu pages)\n",
 		enabled, pageblock_nr_pages);
 	return 0;
 
@@ -575,4 +617,4 @@ module_exit(mw_exit);
 MODULE_AUTHOR("Memwatcher contributors");
 MODULE_DESCRIPTION("Continuous online physical memory test page isolator");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("1.0.0");
+MODULE_VERSION("1.1.0-dev");

@@ -1,4 +1,4 @@
-.TH MEMWATCHER 8 "September 2026" "memwatcher 1.0.0" "System Administration"
+.TH MEMWATCHER 8 "September 2026" "memwatcher 1.1.0-dev" "System Administration"
 .SH NAME
 memwatcher \- experimental continuous online physical-memory tester
 .SH SYNOPSIS
@@ -6,6 +6,9 @@ memwatcher \- experimental continuous online physical-memory tester
 .RI [ options ]
 .br
 .B memwatcher selftest
+.RI [ options ]
+.br
+.B memwatcher preload --yes-i-understand
 .RI [ options ]
 .br
 .B memwatcher scan --yes-i-understand
@@ -28,6 +31,10 @@ Show ABI, pageblock size, counters, and queryable quarantined PFNs.
 Run the pattern engine on ordinary allocated process memory. This does not claim
 physical pages through the module.
 .TP
+.B preload
+On bare metal, securely read the durable bad-PFN file and retain those pages
+without mapping or retesting them. Automatic preload refuses VMs and containers.
+.TP
 .B scan
 Enumerate online physical memory and attempt a destructive pageblock sweep.
 .SH OPTIONS
@@ -37,6 +44,10 @@ Device node. Default is /dev/memwatcher.
 .TP
 .BI --state " path"
 Append-only scan ledger. Default is /var/lib/memwatcher/state.tsv.
+.TP
+.BI --bad-pages " path"
+Machine-bound durable bad-PFN file. Default is
+/var/lib/memwatcher/bad-pages.tsv.
 .TP
 .BI --interval " seconds"
 Nonnegative delay between pageblock attempts. Default is 10.
@@ -65,6 +76,11 @@ Enumerate candidate pageblocks without opening the kernel device.
 .B --yes-i-understand
 Mandatory acknowledgement for a destructive scan.
 .TP
+.B --allow-virtualized-preload
+Override the preload refusal in a detected VM or container. This normally
+reserves unrelated guest PFNs after their host backing has changed and is not
+recommended.
+.TP
 .BI --mib " count"
 Allocation size for selftest. Default is 16 MiB.
 .SH SAFETY
@@ -79,6 +95,9 @@ Restricted kernel-module interface.
 .TP
 .I /var/lib/memwatcher/state.tsv
 Default append-only result ledger.
+.TP
+.I /var/lib/memwatcher/bad-pages.tsv
+Root-owned, machine-bound durable bad-PFN records used by preload.
 .SH SEE ALSO
 .BR memtester (8),
 .BR systemd.service (5)

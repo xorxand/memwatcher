@@ -30,3 +30,10 @@ kernel module safe against a hostile root user. Root can already compromise the
 host. The main security goals are preventing unprivileged physical-memory access,
 maintaining exclusive ownership, and never returning uncertain pages after a
 crash or malformed completion.
+
+The durable bad-PFN file is a denial-of-service control surface: adding arbitrary
+PFNs can cause usable memory to be retained. Memwatcher accepts only a regular
+file owned by its effective UID with no group/other write bits, refuses symlinks,
+caps its record count and size, and binds it to `/etc/machine-id`. Keep
+`/var/lib/memwatcher` writable only by root. Automatic replay is disabled in VMs
+and containers because their PFNs are not stable hardware identities.
