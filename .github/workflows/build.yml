@@ -1,0 +1,31 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential linux-headers-generic
+      - name: Select installed generic headers
+        run: echo "KDIR=$(find /usr/src -maxdepth 1 -type d -name 'linux-headers-*-generic' | sort -V | tail -1)" >> "$GITHUB_ENV"
+      - name: Build
+        run: make all KDIR="$KDIR"
+      - name: Test user-space engine
+        run: make test KDIR="$KDIR"
+      - name: Collect build artifacts
+        run: |
+          mkdir -p ci-artifacts
+          cp build/memwatcher ci-artifacts/
+          cp kernel/memwatcher.ko ci-artifacts/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: memwatcher-${{ github.sha }}
+          path: ci-artifacts/

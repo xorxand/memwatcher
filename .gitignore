@@ -1,0 +1,13 @@
+/build/
+/dist/
+/kernel/.*.cmd
+/kernel/.tmp_versions/
+/kernel/Module.symvers
+/kernel/modules.order
+/kernel/*.ko
+/kernel/*.mod
+/kernel/*.mod.c
+/kernel/*.mod.o
+/kernel/*.o
+*.swp
+*~

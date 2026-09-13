@@ -1,0 +1,33 @@
+[Unit]
+Description=Slow continuous online physical memory test
+Documentation=https://github.com/xorxand/memwatcher
+ConditionPathExists=/dev/memwatcher
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/memwatcher scan --forever --interval 10 --yes-i-understand
+Restart=on-failure
+RestartSec=30
+Nice=19
+CPUSchedulingPolicy=idle
+IOSchedulingClass=idle
+MemoryLow=0
+OOMScoreAdjust=500
+UMask=0077
+StateDirectory=memwatcher
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=false
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=CAP_SYS_RAWIO CAP_SETUID CAP_SETGID
+
+[Install]
+WantedBy=multi-user.target

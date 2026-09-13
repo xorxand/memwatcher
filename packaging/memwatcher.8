@@ -1,0 +1,84 @@
+.TH MEMWATCHER 8 "September 2026" "memwatcher 1.0.0" "System Administration"
+.SH NAME
+memwatcher \- experimental continuous online physical-memory tester
+.SH SYNOPSIS
+.B memwatcher info
+.RI [ options ]
+.br
+.B memwatcher selftest
+.RI [ options ]
+.br
+.B memwatcher scan --yes-i-understand
+.RI [ options ]
+.SH DESCRIPTION
+Memwatcher slowly asks its companion kernel module to isolate one physical
+pageblock at a time. A disposable, low-priority process writes and verifies
+memory-test patterns. Good pages return to Linux; suspect or uncertain pages
+remain allocated until reboot.
+.PP
+This is destructive, experimental kernel software. Test it only in a disposable
+virtual machine before considering lab hardware. It is not a substitute for ECC,
+EDAC monitoring, backups, or an offline memory test.
+.SH COMMANDS
+.TP
+.B info
+Show ABI, pageblock size, counters, and queryable quarantined PFNs.
+.TP
+.B selftest
+Run the pattern engine on ordinary allocated process memory. This does not claim
+physical pages through the module.
+.TP
+.B scan
+Enumerate online physical memory and attempt a destructive pageblock sweep.
+.SH OPTIONS
+.TP
+.BI --device " path"
+Device node. Default is /dev/memwatcher.
+.TP
+.BI --state " path"
+Append-only scan ledger. Default is /var/lib/memwatcher/state.tsv.
+.TP
+.BI --interval " seconds"
+Nonnegative delay between pageblock attempts. Default is 10.
+.TP
+.BI --passes " count"
+Number of sweeps. Default is 1.
+.TP
+.B --forever
+Repeat sweeps until SIGINT or SIGTERM.
+.TP
+.BI --start-pfn " pfn"
+First PFN in a restricted range; requires --end-pfn.
+.TP
+.BI --end-pfn " pfn"
+Exclusive end PFN in a restricted range; requires --start-pfn.
+.TP
+.B --quick
+Use a reduced fixed-pattern set. March and address-derived tests still run.
+.TP
+.B --no-cache-flush
+Permit a cache-resident test. This is weaker and not recommended.
+.TP
+.B --dry-run
+Enumerate candidate pageblocks without opening the kernel device.
+.TP
+.B --yes-i-understand
+Mandatory acknowledgement for a destructive scan.
+.TP
+.BI --mib " count"
+Allocation size for selftest. Default is 16 MiB.
+.SH SAFETY
+The module is disarmed unless loaded with enabled=1. Opening the device requires
+CAP_SYS_RAWIO. If a test worker crashes or abandons a claim, the entire claimed
+pageblock is retained. Once quarantine occurs, module removal and system suspend
+are intentionally prevented until reboot.
+.SH FILES
+.TP
+.I /dev/memwatcher
+Restricted kernel-module interface.
+.TP
+.I /var/lib/memwatcher/state.tsv
+Default append-only result ledger.
+.SH SEE ALSO
+.BR memtester (8),
+.BR systemd.service (5)
