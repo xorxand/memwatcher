@@ -2,7 +2,8 @@
 
 The price of hardware has gotten to the point where it's not cheap to replace slightly faulty hardware like memory or disk so it occurred to me, I wonder if memory has the same thing that spinning disks do where you can find a bad block of memory and then just not use it and get good reliability out of a stick of memory that has errors on it.
 
-So I had the klanker make this:
+I ran into this problem where I had a zfs pool where both halves of a mirror had a disk error on the same data and it was unrecoverable. I thought to myself "self, what are the chances of that actually happening, that two disks go bad at the same time at the same place."
+Well, it turned out to be a memory problem. memtest86 found a handful of bits that were consistently unable to produce reliable results. Seemed a shame to throw out a 32gig stick of memory because of a few bad bits, so I had the klanker make this:
 
 
 Memwatcher is an experimental Linux kernel module and user-space daemon that
