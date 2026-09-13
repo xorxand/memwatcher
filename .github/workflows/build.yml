@@ -11,7 +11,7 @@ jobs:
   ubuntu:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y build-essential linux-headers-generic
       - name: Select installed generic headers
@@ -25,7 +25,7 @@ jobs:
           mkdir -p ci-artifacts
           cp build/memwatcher ci-artifacts/
           cp kernel/memwatcher.ko ci-artifacts/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: memwatcher-${{ github.sha }}
           path: ci-artifacts/
