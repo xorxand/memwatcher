@@ -592,7 +592,7 @@ static int __init mw_init(void)
 	if (ret)
 		goto unregister_pm;
 
-	pr_info("memwatcher 1.1.0-dev loaded (enabled=%d, pageblock=%lu pages)\n",
+	pr_info("memwatcher 1.1.0 loaded (enabled=%d, pageblock=%lu pages)\n",
 		enabled, pageblock_nr_pages);
 	return 0;
 
@@ -617,4 +617,4 @@ module_exit(mw_exit);
 MODULE_AUTHOR("Memwatcher contributors");
 MODULE_DESCRIPTION("Continuous online physical memory test page isolator");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("1.1.0-dev");
+MODULE_VERSION("1.1.0");

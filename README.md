@@ -14,14 +14,14 @@ pages to the allocator or retains suspect pages until reboot.
 
 > [!CAUTION]
 > This is low-level, destructive, experimental software. A kernel or hardware
-> bug can crash the machine or corrupt data. Version 1.0.0 has been compiled and
+> bug can crash the machine or corrupt data. Version 1.1.0 has been compiled and
 > its user-space engine tested on Ubuntu's 6.8 kernel headers; it has **not** had
 > destructive in-kernel testing on production hardware. Start in a disposable
 > VM with no valuable data. Memwatcher does not replace ECC, EDAC monitoring,
 > backups, or an offline tester such as Memtest86+.
 
-The `main` branch is currently the ABI-v2 1.1.0 development line; the immutable
-1.0.0 release remains available from GitHub.
+The current release is ABI-v2 version 1.1.0. The immutable 1.0.0 release remains
+available from GitHub for users of the original ABI.
 
 ## What it does
 

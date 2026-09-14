@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 - 2026-09-13
 
 - Persist confirmed bad PFNs in a secure, machine-bound file and preload them
   into volatile kernel quarantine before the scanner starts on bare metal.

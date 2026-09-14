@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-VERSION := 1.1.0-dev
+VERSION := 1.1.0
 CC ?= cc
 CFLAGS ?= -O2 -g
 CPPFLAGS += -Iinclude -Isrc
@@ -62,7 +62,11 @@ dist: all
 		--exclude='./dist' --exclude='*.cmd' --exclude='*.o' --exclude='*.ko' \
 		--exclude='*.mod*' --exclude='Module.symvers' --exclude='modules.order' \
 		-czf dist/memwatcher-$(VERSION)-source.tar.gz .
-	cd dist && sha256sum memwatcher-* > SHA256SUMS
+	cd dist && sha256sum \
+		memwatcher-$(VERSION)-linux-x86_64 \
+		memwatcher-$(VERSION)-$(shell uname -r).ko \
+		memwatcher-$(VERSION)-source.tar.gz \
+		> SHA256SUMS-$(VERSION)
 
 clean:
 	rm -rf build dist

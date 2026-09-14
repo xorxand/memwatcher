@@ -31,7 +31,7 @@
 #include <cpuid.h>
 #endif
 
-#define VERSION "1.1.0-dev"
+#define VERSION "1.1.0"
 #define DEFAULT_INTERVAL 10.0
 #define DEFAULT_STATE "/var/lib/memwatcher/state.tsv"
 #define DEFAULT_BAD_PAGES "/var/lib/memwatcher/bad-pages.tsv"
