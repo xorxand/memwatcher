@@ -14,13 +14,13 @@ pages to the allocator or retains suspect pages until reboot.
 
 > [!CAUTION]
 > This is low-level, destructive, experimental software. A kernel or hardware
-> bug can crash the machine or corrupt data. Version 1.1.0 has been compiled and
+> bug can crash the machine or corrupt data. Version 1.1.1 has been compiled and
 > its user-space engine tested on Ubuntu's 6.8 kernel headers; it has **not** had
 > destructive in-kernel testing on production hardware. Start in a disposable
 > VM with no valuable data. Memwatcher does not replace ECC, EDAC monitoring,
 > backups, or an offline tester such as Memtest86+.
 
-The current release is ABI-v2 version 1.1.0. The immutable 1.0.0 release remains
+The current release is ABI-v2 version 1.1.1. The immutable 1.0.0 release remains
 available from GitHub for users of the original ABI.
 
 ## What it does
@@ -31,9 +31,10 @@ available from GitHub for users of the original ABI.
    migrate movable contents. If anything unmovable remains, the claim fails and
    is skipped without touching that memory.
 4. The module maps only the successfully claimed pages to the child.
-5. The child drops to UID/GID 65534, switches to idle scheduling, and runs fixed
-   patterns, a March C- sequence, and physical-address-derived patterns. On x86,
-   cache lines are flushed before verification by default.
+5. The child drops to the dedicated `memwatcher` system account, restores its
+   parent-death signal after the credential change, switches to idle scheduling,
+   and runs fixed patterns, a March C- sequence, and physical-address-derived
+   patterns. On x86, cache lines are flushed before verification by default.
 6. The mapping is removed before results are submitted. Good pages are freed;
    pages reported bad remain allocated and the module pins itself until reboot.
 7. Confirmed bad PFNs are synchronously written to a root-owned, machine-bound
@@ -43,8 +44,9 @@ available from GitHub for users of the original ABI.
 
 If the child crashes, is killed, loses its report, or closes the device before a
 successful completion, the module fails closed and retains the entire claim.
-The daemon writes an append-only TSV ledger after every attempt. Persistent bad
-PFNs live separately in `/var/lib/memwatcher/bad-pages.tsv`.
+The daemon synchronously writes an append-only TSV ledger after every attempt
+and resumes after its last recorded PFN on restart, wrapping at the end of RAM.
+Persistent bad PFNs live separately in `/var/lib/memwatcher/bad-pages.tsv`.
 
 See [the architecture](docs/architecture.md), [the threat model](SECURITY.md),
 the [persistent quarantine design](docs/persistent-quarantine.md), and
@@ -117,7 +119,10 @@ sudo make install
 sudo systemctl enable --now memwatcher.service
 ```
 
-Installing does not immediately load or enable the module. Starting the service
+Installation also supplies a `sysusers.d` definition for the dedicated,
+non-login `memwatcher` worker account. When `systemd-sysusers` is available,
+`make install` creates it immediately; package managers should run the normal
+sysusers integration. Starting the service
 on bare metal runs `memwatcher-preload.service`: it loads the module with
 `enabled=1`, restores known-bad PFNs, and only then permits the scanner to start.
 If any known-bad pageblock cannot be acquired, preload fails and the scanner is
@@ -135,17 +140,19 @@ memwatcher selftest [--quick] [--no-cache-flush] [--mib N]
 memwatcher preload --yes-i-understand [--bad-pages PATH]
 memwatcher scan --yes-i-understand [--forever] [--passes N]
                 [--interval SECONDS] [--quick]
+                [--worker-user NAME]
                 [--start-pfn PFN --end-pfn PFN]
 ```
 
 Run `memwatcher --help` for the complete option list. `--no-cache-flush` allows
 non-x86 testing, but may verify cache rather than DRAM and is therefore weaker.
 
-The persistent file rejects symlinks, files owned by another UID, group/world
-writable files, malformed records, excessive size, and a machine ID different
-from the current installation. Its updates are flushed to both the file and
-parent directory before scanning continues. Copying the file to another machine
-is intentionally not supported.
+The result ledger refuses symlinks, unsafe parent directories, non-regular
+files, foreign ownership, and group/world-writable files. The durable bad-page
+file additionally rejects malformed records, excessive size, and a machine ID
+different from the current installation. Its updates are flushed to both the
+file and parent directory before scanning continues. Copying the file to another
+machine is intentionally not supported.
 
 ## Design lineage
 

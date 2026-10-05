@@ -10,6 +10,7 @@
 #include <grp.h>
 #include <limits.h>
 #include <math.h>
+#include <pwd.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -31,13 +32,16 @@
 #include <cpuid.h>
 #endif
 
-#define VERSION "1.1.0"
+#define VERSION "1.1.1"
 #define DEFAULT_INTERVAL 10.0
 #define DEFAULT_STATE "/var/lib/memwatcher/state.tsv"
 #define DEFAULT_BAD_PAGES "/var/lib/memwatcher/bad-pages.tsv"
+#define DEFAULT_WORKER_USER "memwatcher"
 
 struct range { uint64_t start_pfn, end_pfn; };
 struct ranges { struct range *items; size_t count, capacity; };
+
+struct worker_identity { uid_t uid; gid_t gid; };
 
 enum child_stage {
 	CHILD_STARTED,
@@ -55,6 +59,8 @@ struct child_report {
 	uint64_t elapsed_ns;
 };
 
+static int selftest_control_logic(void);
+
 static void usage(FILE *out)
 {
 	fprintf(out,
@@ -69,6 +75,7 @@ static void usage(FILE *out)
 		"  --device PATH         device node (default %s)\n"
 		"  --state PATH          append-only ledger (default %s)\n"
 		"  --bad-pages PATH      durable bad-PFN file (default %s)\n"
+		"  --worker-user NAME    dedicated test identity (default %s)\n"
 		"  --interval SECONDS    delay between pageblocks (default %.0f)\n"
 		"  --passes N            sweeps to attempt (default 1)\n"
 		"  --forever             repeat sweeps until stopped\n"
@@ -80,6 +87,7 @@ static void usage(FILE *out)
 		"  --allow-virtualized-preload\n"
 		"                        override VM/container preload refusal\n",
 		VERSION, MW_DEVICE_PATH, DEFAULT_STATE, DEFAULT_BAD_PAGES,
+		DEFAULT_WORKER_USER,
 		DEFAULT_INTERVAL);
 }
 
@@ -142,6 +150,43 @@ static int append_range(struct ranges *ranges, uint64_t start, uint64_t end)
 		ranges->capacity = capacity;
 	}
 	ranges->items[ranges->count++] = (struct range){ start, end };
+	return 0;
+}
+
+static int candidate_at(const struct ranges *ranges, uint64_t pageblock_pages,
+			uint64_t ordinal, uint64_t *pfn)
+{
+	size_t i;
+
+	for (i = 0; i < ranges->count; i++) {
+		uint64_t first, count;
+
+		if (align_pfn_up(ranges->items[i].start_pfn, pageblock_pages, &first) ||
+		    ranges->items[i].end_pfn <= first)
+			continue;
+		count = (ranges->items[i].end_pfn - first) / pageblock_pages;
+		if (ordinal < count) {
+			*pfn = first + ordinal * pageblock_pages;
+			return 0;
+		}
+		ordinal -= count;
+	}
+	return -1;
+}
+
+static uint64_t candidate_after(const struct ranges *ranges,
+				uint64_t pageblock_pages, uint64_t count,
+				uint64_t last_pfn)
+{
+	uint64_t index;
+
+	for (index = 0; index < count; index++) {
+		uint64_t pfn;
+
+		if (!candidate_at(ranges, pageblock_pages, index, &pfn) &&
+		    pfn > last_pfn)
+			return index;
+	}
 	return 0;
 }
 
@@ -212,9 +257,24 @@ static int discover_ranges(struct ranges *ranges, size_t page_size)
 		}
 	}
 	closedir(directory);
-	if (ranges->count)
+	if (ranges->count) {
+		size_t source, destination = 0;
+
 		qsort(ranges->items, ranges->count, sizeof(*ranges->items),
 		      compare_ranges);
+		for (source = 0; source < ranges->count; source++) {
+			if (destination && ranges->items[source].start_pfn <=
+			    ranges->items[destination - 1].end_pfn) {
+				if (ranges->items[source].end_pfn >
+				    ranges->items[destination - 1].end_pfn)
+					ranges->items[destination - 1].end_pfn =
+						ranges->items[source].end_pfn;
+			} else {
+				ranges->items[destination++] = ranges->items[source];
+			}
+		}
+		ranges->count = destination;
+	}
 	return ranges->count ? 0 : -1;
 }
 
@@ -309,14 +369,49 @@ static int command_selftest(bool quick, bool flush_cache, uint64_t mib)
 	}
 	started = monotonic_ns();
 	ret = mw_run_memory_tests(memory, length, &options, &result);
+	free(memory);
+	if (!ret && selftest_control_logic()) {
+		fprintf(stderr, "selftest: control-plane checks failed: %s\n",
+			strerror(errno));
+		return 1;
+	}
 	printf("selftest: %s, %llu MiB, %.3f seconds, cache flush %s\n",
 	       ret ? "FAILED" : "passed", (unsigned long long)mib,
 	       (monotonic_ns() - started) / 1e9, flush_cache ? "on" : "off");
-	free(memory);
 	return ret ? 1 : 0;
 }
 
-static int drop_test_privileges(void)
+static int resolve_worker_identity(const char *name,
+				   struct worker_identity *identity)
+{
+	struct passwd password, *result = NULL;
+	long suggested = sysconf(_SC_GETPW_R_SIZE_MAX);
+	size_t length = suggested > 0 ? (size_t)suggested : 16384U;
+	char *buffer;
+	int ret;
+
+	if (geteuid() != 0) {
+		identity->uid = geteuid();
+		identity->gid = getegid();
+		return 0;
+	}
+	buffer = malloc(length);
+	if (!buffer)
+		return -1;
+	ret = getpwnam_r(name, &password, buffer, length, &result);
+	if (ret || !result || !result->pw_uid) {
+		free(buffer);
+		errno = ret ? ret : ENOENT;
+		return -1;
+	}
+	identity->uid = result->pw_uid;
+	identity->gid = result->pw_gid;
+	free(buffer);
+	return 0;
+}
+
+static int drop_test_privileges(const struct worker_identity *identity,
+				pid_t expected_parent)
 {
 	struct sched_param param = { 0 };
 	(void)setpriority(PRIO_PROCESS, 0, 19);
@@ -326,15 +421,23 @@ static int drop_test_privileges(void)
 	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))
 		return -1;
 	if (geteuid() == 0) {
-		if (setgroups(0, NULL) || setgid(65534) || setuid(65534))
+		if (setgroups(0, NULL) || setgid(identity->gid) ||
+		    setuid(identity->uid))
 			return -1;
+	}
+	if (prctl(PR_SET_PDEATHSIG, SIGKILL))
+		return -1;
+	if (getppid() != expected_parent) {
+		errno = ESRCH;
+		return -1;
 	}
 	return 0;
 }
 
 static int test_one_block(const char *device, const struct mw_info *info,
 			  uint64_t pfn, bool quick, bool flush_cache,
-			  struct child_report *report)
+			  const struct worker_identity *identity,
+			  pid_t expected_parent, struct child_report *report)
 {
 	struct mw_claim claim = {
 		.start_pfn = pfn,
@@ -371,7 +474,7 @@ static int test_one_block(const char *device, const struct mw_info *info,
 		return -1;
 	}
 	report->stage = CHILD_MAPPED;
-	if (drop_test_privileges()) {
+	if (drop_test_privileges(identity, expected_parent)) {
 		report->error = errno;
 		munmap(mapping, length);
 		(void)ioctl(fd, MW_IOC_QUARANTINE);
@@ -402,8 +505,9 @@ static int test_one_block(const char *device, const struct mw_info *info,
 }
 
 static int run_child(const char *device, const struct mw_info *info,
-		     uint64_t pfn, bool quick, bool flush_cache,
-		     struct child_report *report, int *signal_number)
+			     uint64_t pfn, bool quick, bool flush_cache,
+			     const struct worker_identity *identity,
+			     struct child_report *report, int *signal_number)
 {
 	struct child_report *shared;
 	int status;
@@ -414,25 +518,45 @@ static int run_child(const char *device, const struct mw_info *info,
 	*signal_number = 0;
 	shared = mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
 		      MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-	if (shared == MAP_FAILED)
+	if (shared == MAP_FAILED) {
+		report->error = errno;
 		return -1;
+	}
 	memset(shared, 0, sizeof(*shared));
 	child = fork();
 	if (child < 0) {
+		report->error = errno;
 		munmap(shared, sizeof(*shared));
 		return -1;
 	}
 	if (!child) {
 		int rc;
+		pid_t expected_parent = getppid();
 
-		(void)prctl(PR_SET_PDEATHSIG, SIGKILL);
-		rc = test_one_block(device, info, pfn, quick, flush_cache, shared);
+		(void)signal(SIGINT, SIG_DFL);
+		(void)signal(SIGTERM, SIG_DFL);
+		if (prctl(PR_SET_PDEATHSIG, SIGKILL)) {
+			shared->error = errno;
+			_exit(1);
+		}
+		if (getppid() != expected_parent) {
+			shared->error = ESRCH;
+			_exit(1);
+		}
+		rc = test_one_block(device, info, pfn, quick, flush_cache, identity,
+				    expected_parent, shared);
 		_exit(rc ? 1 : shared->test_status ? 10 : 0);
 	}
 	do {
 		waited = waitpid(child, &status, 0);
 	} while (waited < 0 && errno == EINTR);
 	if (waited < 0) {
+		int saved_errno = errno;
+
+		(void)kill(child, SIGKILL);
+		while (waitpid(child, NULL, 0) < 0 && errno == EINTR) { }
+		memcpy(report, shared, sizeof(*report));
+		report->error = saved_errno;
 		munmap(shared, sizeof(*shared));
 		return -1;
 	}
@@ -446,42 +570,201 @@ static int run_child(const char *device, const struct mw_info *info,
 static FILE *open_ledger(const char *path)
 {
 	char directory[PATH_MAX], *slash;
-	FILE *file;
+	const char *basename;
+	struct stat status;
+	FILE *file = NULL;
+	int directory_fd = -1, fd = -1, saved_errno;
 
-	if (strlen(path) >= sizeof(directory)) {
+	if (!path || !*path || strlen(path) >= sizeof(directory)) {
 		errno = ENAMETOOLONG;
 		return NULL;
 	}
 	strcpy(directory, path);
 	slash = strrchr(directory, '/');
+	basename = strrchr(path, '/');
+	basename = basename ? basename + 1 : path;
 	if (slash) {
-		*slash = 0;
-		if (*directory && mkdir(directory, 0750) && errno != EEXIST)
+		if (!*basename) {
+			errno = EINVAL;
 			return NULL;
+		}
+		if (slash == directory) {
+			directory[1] = '\0';
+		} else {
+			*slash = '\0';
+			if (mkdir(directory, 0750) && errno != EEXIST)
+				return NULL;
+		}
+	} else {
+		strcpy(directory, ".");
 	}
-	file = fopen(path, "a+e");
-	if (file)
-		(void)fchmod(fileno(file), 0600);
+	directory_fd = open(directory, O_RDONLY | O_CLOEXEC | O_DIRECTORY |
+			    O_NOFOLLOW);
+	if (directory_fd < 0 || fstat(directory_fd, &status))
+		goto out;
+	if (!S_ISDIR(status.st_mode) || status.st_uid != geteuid() ||
+	    (status.st_mode & 0022)) {
+		errno = EPERM;
+		goto out;
+	}
+	fd = openat(directory_fd, basename,
+		    O_RDWR | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+	if (fd < 0 || fstat(fd, &status))
+		goto out;
+	if (!S_ISREG(status.st_mode) || status.st_uid != geteuid() ||
+	    (status.st_mode & 0022)) {
+		errno = EPERM;
+		goto out;
+	}
+	if (fchmod(fd, 0600))
+		goto out;
+	file = fdopen(fd, "a+");
+	if (!file)
+		goto out;
+	fd = -1;
+out:
+	saved_errno = errno;
+	if (fd >= 0)
+		close(fd);
+	if (directory_fd >= 0)
+		close(directory_fd);
+	errno = saved_errno;
 	return file;
 }
 
-static void log_result(FILE *ledger, uint64_t pfn, const struct mw_info *info,
-		       const struct child_report *report, int child_rc, int sig)
+static bool read_ledger_cursor(FILE *ledger, uint64_t *last_pfn)
+{
+	char *line = NULL;
+	size_t capacity = 0;
+	bool found = false;
+
+	rewind(ledger);
+	while (getline(&line, &capacity, ledger) >= 0) {
+		char *field = strchr(line, '\t');
+		char *end;
+		unsigned long long parsed;
+
+		if (!field)
+			continue;
+		errno = 0;
+		parsed = strtoull(field + 1, &end, 0);
+		if (!errno && end != field + 1 && *end == '\t') {
+			*last_pfn = parsed;
+			found = true;
+		}
+	}
+	free(line);
+	clearerr(ledger);
+	(void)fseek(ledger, 0, SEEK_END);
+	return found;
+}
+
+static const char *result_status(const struct child_report *report,
+				 int child_rc, int sig)
+{
+	if (sig)
+		return report->stage >= CHILD_CLAIMED ? "crashed-quarantined" :
+			"crashed-before-claim";
+	if (child_rc < 0)
+		return "runner-error";
+	if (report->error)
+		return report->stage == CHILD_COMPLETED ? "test-error-quarantined" :
+			report->stage >= CHILD_CLAIMED ? "error-quarantined" :
+			"skipped";
+	return report->test_status ? "bad-quarantined" : "good";
+}
+
+static int selftest_control_logic(void)
+{
+	struct ranges ranges = { 0 };
+	struct child_report report = { 0 };
+	char directory[] = "/tmp/memwatcher-ledger-XXXXXX";
+	char path[PATH_MAX] = { 0 }, link_path[PATH_MAX] = { 0 };
+	char unsafe_path[PATH_MAX] = { 0 };
+	uint64_t cursor = 0, pfn = 0;
+	FILE *ledger = NULL, *unexpected = NULL;
+	int ret = -1, saved_errno;
+
+	if (append_range(&ranges, 3, 20) || append_range(&ranges, 32, 48) ||
+	    candidate_at(&ranges, 8, 0, &pfn) || pfn != 8 ||
+	    candidate_at(&ranges, 8, 1, &pfn) || pfn != 32 ||
+	    candidate_after(&ranges, 8, 3, 32) != 2 ||
+	    strcmp(result_status(&report, -1, 0), "runner-error")) {
+		errno = EPROTO;
+		goto out;
+	}
+	if (!mkdtemp(directory))
+		goto out;
+	if (snprintf(path, sizeof(path), "%s/state.tsv", directory) >=
+		    (int)sizeof(path) ||
+	    snprintf(link_path, sizeof(link_path), "%s/link.tsv", directory) >=
+		    (int)sizeof(link_path) ||
+	    snprintf(unsafe_path, sizeof(unsafe_path), "%s/unsafe.tsv", directory) >=
+		    (int)sizeof(unsafe_path)) {
+		errno = ENAMETOOLONG;
+		goto out;
+	}
+	ledger = open_ledger(path);
+	if (!ledger ||
+	    fprintf(ledger, "1\t0x10\t512\tgood\t0\t0\t0\t0.1\n"
+			    "2\t0x20\t512\tgood\t0\t0\t0\t0.1\n") < 0 ||
+	    fflush(ledger) || !read_ledger_cursor(ledger, &cursor) || cursor != 0x20)
+		goto out;
+	if (fclose(ledger))
+		goto out;
+	ledger = NULL;
+	if (symlink(path, link_path))
+		goto out;
+	errno = 0;
+	unexpected = open_ledger(link_path);
+	if (unexpected || errno != ELOOP) {
+		errno = EPROTO;
+		goto out;
+	}
+	if (chmod(directory, 0777))
+		goto out;
+	errno = 0;
+	unexpected = open_ledger(unsafe_path);
+	if (unexpected || errno != EPERM) {
+		errno = EPROTO;
+		goto out;
+	}
+	ret = 0;
+out:
+	saved_errno = errno;
+	if (unexpected)
+		fclose(unexpected);
+	if (ledger)
+		fclose(ledger);
+	(void)chmod(directory, 0700);
+	if (*unsafe_path)
+		(void)unlink(unsafe_path);
+	if (*link_path)
+		(void)unlink(link_path);
+	if (*path)
+		(void)unlink(path);
+	(void)rmdir(directory);
+	free(ranges.items);
+	errno = saved_errno;
+	return ret;
+}
+
+static int log_result(FILE *ledger, uint64_t pfn, const struct mw_info *info,
+		      const struct child_report *report, int child_rc, int sig)
 {
 	struct timespec now;
-	const char *status = sig ?
-		(report->stage >= CHILD_CLAIMED ? "crashed-quarantined" :
-		 "crashed-before-claim") :
-		report->error ?
-		(report->stage == CHILD_COMPLETED ? "test-error-quarantined" :
-		 report->stage >= CHILD_CLAIMED ? "error-quarantined" : "skipped") :
-		report->test_status ? "bad-quarantined" : "good";
+	const char *status = result_status(report, child_rc, sig);
+	int written;
+
 	clock_gettime(CLOCK_REALTIME, &now);
-	fprintf(ledger, "%lld\t0x%llx\t%u\t%s\t%u\t%d\t%d\t%.6f\n",
-		(long long)now.tv_sec, (unsigned long long)pfn,
-		info->pageblock_pages, status, report->result.bad_count,
-		report->error, sig ? sig : child_rc, report->elapsed_ns / 1e9);
-	fflush(ledger);
+	written = fprintf(ledger, "%lld\t0x%llx\t%u\t%s\t%u\t%d\t%d\t%.6f\n",
+			  (long long)now.tv_sec, (unsigned long long)pfn,
+			  info->pageblock_pages, status,
+			  report->result.bad_count, report->error,
+			  sig ? sig : child_rc, report->elapsed_ns / 1e9);
+	if (written < 0 || fflush(ledger) || fsync(fileno(ledger)))
+		return -1;
+	return 0;
 }
 
 static void sleep_interval(double seconds)
@@ -511,18 +794,71 @@ static bool text_file_contains(const char *path, const char *needle)
 	return got && (!needle || strstr(buffer, needle));
 }
 
+static int systemd_virtualization_status(void)
+{
+	static const char *const paths[] = {
+		"/usr/bin/systemd-detect-virt",
+		"/bin/systemd-detect-virt",
+	};
+	size_t i;
+
+	for (i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+		int status;
+		pid_t child, waited;
+
+		if (access(paths[i], X_OK))
+			continue;
+		child = fork();
+		if (child < 0)
+			return -1;
+		if (!child) {
+			execl(paths[i], paths[i], "--quiet", (char *)NULL);
+			_exit(127);
+		}
+		do {
+			waited = waitpid(child, &status, 0);
+		} while (waited < 0 && errno == EINTR);
+		if (waited < 0 || !WIFEXITED(status))
+			return -1;
+		if (WEXITSTATUS(status) == 0)
+			return 1;
+		if (WEXITSTATUS(status) == 1)
+			return 0;
+		return -1;
+	}
+	return -1;
+}
+
 static bool virtualized_or_containerized(void)
 {
 	const char *container = getenv("container");
+	int systemd_status = systemd_virtualization_status();
+	static const char *const dmi_markers[] = {
+		"KVM", "QEMU", "VMware", "VirtualBox", "Microsoft Corporation",
+		"Xen", "Bochs", "Parallels",
+	};
+	size_t i;
+
+	if (systemd_status >= 0)
+		return systemd_status;
 
 	if ((container && *container) || access("/.dockerenv", F_OK) == 0 ||
+	    access("/run/.containerenv", F_OK) == 0 ||
 	    text_file_contains("/run/systemd/container", NULL) ||
 	    text_file_contains("/sys/hypervisor/type", NULL) ||
+	    text_file_contains("/proc/device-tree/hypervisor/compatible", NULL) ||
+	    text_file_contains("/sys/firmware/devicetree/base/hypervisor/compatible",
+			       NULL) ||
 	    text_file_contains("/proc/1/cgroup", "docker") ||
 	    text_file_contains("/proc/1/cgroup", "lxc") ||
 	    text_file_contains("/proc/1/cgroup", "kubepods") ||
 	    text_file_contains("/proc/1/cgroup", "containerd"))
 		return true;
+	for (i = 0; i < sizeof(dmi_markers) / sizeof(dmi_markers[0]); i++) {
+		if (text_file_contains("/sys/class/dmi/id/product_name", dmi_markers[i]) ||
+		    text_file_contains("/sys/class/dmi/id/sys_vendor", dmi_markers[i]))
+			return true;
+	}
 #if defined(__x86_64__) || defined(__i386__)
 	{
 		unsigned int eax, ebx, ecx, edx;
@@ -693,14 +1029,17 @@ static int command_scan(const char *device, const char *state, double interval,
 			uint64_t passes, bool forever, bool quick,
 			bool flush_cache, bool dry_run, bool acknowledged,
 			bool restricted, uint64_t restrict_start, uint64_t restrict_end,
-			const char *bad_pages)
+			const char *bad_pages, const char *worker_user)
 {
 	struct ranges ranges = { 0 };
 	struct mw_bad_page_db known_bad = { 0 };
+	struct worker_identity worker = { 0 };
 	struct mw_info info;
 	FILE *ledger = NULL;
-	uint64_t pass, candidates = 0, known_bad_blocks = 0;
+	uint64_t pass, candidates = 0, known_bad_blocks = 0, resume_index = 0;
 	int fd = -1, rc = 1;
+	uint64_t last_pfn = 0;
+	bool have_cursor = false;
 	bool persistence_failed = false;
 	bool persistence_enabled = !virtualized_or_containerized();
 	size_t i;
@@ -710,6 +1049,11 @@ static int command_scan(const char *device, const char *state, double interval,
 		return 2;
 	}
 	if (!dry_run) {
+		if (resolve_worker_identity(worker_user, &worker)) {
+			fprintf(stderr, "cannot resolve dedicated worker user %s: %s\n",
+				worker_user, strerror(errno));
+			goto out;
+		}
 		fd = open_device(device);
 		if (fd < 0 || get_info_fd(fd, &info)) {
 			if (fd >= 0) perror("MW_IOC_GET_INFO");
@@ -764,53 +1108,71 @@ static int command_scan(const char *device, const char *state, double interval,
 		printf("%llu pageblocks contain quarantined known-bad PFNs and will be skipped\n",
 		       (unsigned long long)known_bad_blocks);
 	if (dry_run) { rc = 0; goto out; }
+	if (!candidates) {
+		fprintf(stderr, "no pageblock-aligned candidates found\n");
+		goto out;
+	}
+	if (persistence_enabled && known_bad_blocks >= candidates) {
+		printf("all candidate pageblocks contain known-bad PFNs; nothing to scan\n");
+		rc = 0;
+		goto out;
+	}
 	ledger = open_ledger(state);
 	if (!ledger) { perror("open state ledger"); goto out; }
-	if (fseek(ledger, 0, SEEK_END) == 0 && ftell(ledger) == 0)
+	have_cursor = read_ledger_cursor(ledger, &last_pfn);
+	if (ftell(ledger) == 0)
 		fprintf(ledger, "# unix_time\tstart_pfn\tpages\tstatus\tbad_pages\terrno\tchild_status\tseconds\n");
+	if (have_cursor)
+		resume_index = candidate_after(&ranges, info.pageblock_pages,
+					       candidates, last_pfn);
 
 	signal(SIGINT, request_stop);
 	signal(SIGTERM, request_stop);
 	for (pass = 0; (forever || pass < passes) && !stop_requested; pass++) {
+		uint64_t step;
+		uint64_t start_index = pass ? 0 : resume_index;
+
 		printf("starting sweep %llu\n", (unsigned long long)(pass + 1));
-		for (i = 0; i < ranges.count && !stop_requested; i++) {
+		for (step = 0; step < candidates && !stop_requested; step++) {
+			struct child_report report;
+			uint64_t index = (start_index + step) % candidates;
 			uint64_t pfn;
+			int sig, child_rc;
 
-			if (align_pfn_up(ranges.items[i].start_pfn,
-					 info.pageblock_pages, &pfn))
+			if (candidate_at(&ranges, info.pageblock_pages, index, &pfn))
 				continue;
-			for (; pfn <= ranges.items[i].end_pfn &&
-			       ranges.items[i].end_pfn - pfn >= info.pageblock_pages &&
-			       !stop_requested; pfn += info.pageblock_pages) {
-				struct child_report report;
+			if (persistence_enabled &&
+			    database_intersects(&known_bad, pfn,
+						info.pageblock_pages))
+				continue;
 
-				if (persistence_enabled &&
-				    database_intersects(&known_bad, pfn,
-							info.pageblock_pages))
-					continue;
-
-				int sig, child_rc = run_child(device, &info, pfn, quick,
-							flush_cache, &report, &sig);
-				if (persistence_enabled &&
-				    persist_bad_result(bad_pages, pfn, &info, &report,
+			child_rc = run_child(device, &info, pfn, quick, flush_cache,
+					     &worker, &report, &sig);
+			if (persistence_enabled &&
+			    persist_bad_result(bad_pages, pfn, &info, &report,
 						       &known_bad)) {
-					fprintf(stderr, "cannot persist bad PFNs to %s: %s; stopping scan\n",
-						bad_pages, strerror(errno));
-					stop_requested = 1;
-					persistence_failed = true;
-				}
-				log_result(ledger, pfn, &info, &report, child_rc, sig);
-				if (sig)
-					fprintf(stderr, "pfn 0x%llx: tester died on signal %d; claim quarantined\n",
-						(unsigned long long)pfn, sig);
-				else if (report.error && report.error != EBUSY && report.error != EINVAL)
-					fprintf(stderr, "pfn 0x%llx: %s\n",
-						(unsigned long long)pfn, strerror(report.error));
-				else if (report.test_status > 0)
-					fprintf(stderr, "pfn 0x%llx: %u bad pages quarantined\n",
-						(unsigned long long)pfn, report.result.bad_count);
-				sleep_interval(interval);
+				fprintf(stderr, "cannot persist bad PFNs to %s: %s; stopping scan\n",
+					bad_pages, strerror(errno));
+				stop_requested = 1;
+				persistence_failed = true;
 			}
+			if (log_result(ledger, pfn, &info, &report, child_rc, sig)) {
+				fprintf(stderr, "cannot persist scan ledger %s: %s; stopping scan\n",
+					state, strerror(errno));
+				stop_requested = 1;
+				persistence_failed = true;
+			}
+			if (sig)
+				fprintf(stderr, "pfn 0x%llx: tester died on signal %d; claim quarantined\n",
+					(unsigned long long)pfn, sig);
+			else if (report.error && report.error != EBUSY &&
+				 report.error != EINVAL)
+				fprintf(stderr, "pfn 0x%llx: %s\n",
+					(unsigned long long)pfn, strerror(report.error));
+			else if (report.test_status > 0)
+				fprintf(stderr, "pfn 0x%llx: %u bad pages quarantined\n",
+					(unsigned long long)pfn, report.result.bad_count);
+			sleep_interval(interval);
 		}
 	}
 	rc = persistence_failed ? 1 : 0;
@@ -826,6 +1188,7 @@ int main(int argc, char **argv)
 {
 	const char *command, *device = MW_DEVICE_PATH, *state = DEFAULT_STATE;
 	const char *bad_pages = DEFAULT_BAD_PAGES;
+	const char *worker_user = DEFAULT_WORKER_USER;
 	double interval = DEFAULT_INTERVAL;
 	uint64_t passes = 1, start = 0, end = 0, mib = 16;
 	bool forever = false, quick = false, flush_cache = true, dry_run = false;
@@ -844,6 +1207,7 @@ int main(int argc, char **argv)
 		{ "quick", no_argument, NULL, 'q' },
 		{ "no-cache-flush", no_argument, NULL, 1002 },
 		{ "allow-virtualized-preload", no_argument, NULL, 1004 },
+		{ "worker-user", required_argument, NULL, 1005 },
 		{ "dry-run", no_argument, NULL, 'n' },
 		{ "yes-i-understand", no_argument, NULL, 'y' },
 		{ "mib", required_argument, NULL, 'm' },
@@ -879,6 +1243,7 @@ int main(int argc, char **argv)
 		case 1002: flush_cache = false; break;
 		case 1003: bad_pages = optarg; break;
 		case 1004: allow_virtualized_preload = true; break;
+		case 1005: worker_user = optarg; break;
 		case 'V': puts(VERSION); return 0;
 		case 'h': usage(stdout); return 0;
 		default: return 2;
@@ -898,7 +1263,7 @@ int main(int argc, char **argv)
 		}
 		return command_scan(device, state, interval, passes, forever, quick,
 				    flush_cache, dry_run, acknowledged, have_start,
-				    start, end, bad_pages);
+				    start, end, bad_pages, worker_user);
 	}
 	usage(stderr);
 	return 2;

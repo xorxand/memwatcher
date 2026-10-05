@@ -20,6 +20,11 @@ the scanner continues. The parser deduplicates PFNs and refuses malformed,
 oversized, symlinked, wrongly owned, group/world writable, or foreign-machine
 files. The cap is 65,536 recorded PFNs.
 
+The separate scan ledger is also opened without following symlinks and only
+inside an effective-UID-owned directory without group/other write access. Each
+record is flushed before the next attempt and doubles as the restart cursor;
+bad-page persistence remains in the independently validated file above.
+
 ## Boot sequence
 
 ```text

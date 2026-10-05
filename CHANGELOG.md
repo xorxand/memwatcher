@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.1 - 2026-10-05
+
+- Block new claims throughout suspend/hibernate transitions, recheck
+  `CAP_SYS_RAWIO` for every claim, make successful claim sessions one-shot,
+  and require a real mapping before normal completion.
+- Replace the shared `nobody` worker identity with a dedicated system account
+  and restore parent-death protection after dropping credentials.
+- Correct runner-error ledger records, durably resume scans after the last
+  attempted PFN, and make sequential quarantine enumeration linear.
+- Harden ledger pathname handling and expand VM/container detection.
+
 ## 1.1.0 - 2026-09-13
 
 - Persist confirmed bad PFNs in a secure, machine-bound file and preload them

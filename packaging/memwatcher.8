@@ -1,4 +1,4 @@
-.TH MEMWATCHER 8 "September 2026" "memwatcher 1.1.0" "System Administration"
+.TH MEMWATCHER 8 "October 2026" "memwatcher 1.1.1" "System Administration"
 .SH NAME
 memwatcher \- experimental continuous online physical-memory tester
 .SH SYNOPSIS
@@ -49,6 +49,11 @@ Append-only scan ledger. Default is /var/lib/memwatcher/state.tsv.
 Machine-bound durable bad-PFN file. Default is
 /var/lib/memwatcher/bad-pages.tsv.
 .TP
+.BI --worker-user " name"
+Dedicated, non-shared account used by destructive test children. The default is
+memwatcher, supplied by the packaged sysusers.d definition. Root scans refuse to
+start if this account is unavailable.
+.TP
 .BI --interval " seconds"
 Nonnegative delay between pageblock attempts. Default is 10.
 .TP
@@ -88,6 +93,11 @@ The module is disarmed unless loaded with enabled=1. Opening the device requires
 CAP_SYS_RAWIO. If a test worker crashes or abandons a claim, the entire claimed
 pageblock is retained. Once quarantine occurs, module removal and system suspend
 are intentionally prevented until reboot.
+.PP
+Every claim rechecks CAP_SYS_RAWIO and a file session can successfully claim only
+once. Test children drop to a dedicated account after mapping. The result ledger
+is synchronously flushed and its last PFN is used as the next-start cursor so
+restarts rotate through the complete candidate set.
 .SH FILES
 .TP
 .I /dev/memwatcher

@@ -21,9 +21,12 @@ period before publishing a working exploit.
 ## Threat model
 
 The `/dev/memwatcher` interface is restricted to `CAP_SYS_RAWIO` and mode 0600.
-Only one session is allowed. The mapped VMA cannot be executed, expanded, dumped,
-or inherited across fork. Test workers drop identity and set `no_new_privs` only
-after the privileged claim and mapping are complete.
+Opening and every new claim require the capability, and a session can
+successfully claim only once. The mapped VMA cannot be executed, expanded,
+dumped, or inherited across fork. Test workers drop to the dedicated
+`memwatcher` system account and set `no_new_privs` only after the privileged
+claim and mapping are complete. Parent-death protection is restored after the
+credential transition.
 
 These measures reduce accidental and post-open misuse; they do not make a buggy
 kernel module safe against a hostile root user. Root can already compromise the

@@ -47,7 +47,9 @@ report only after every VMA is gone.
 The module permits one open session globally. That simplifies ownership and
 makes concurrent claims impossible in version 1. It blocks memory-hotplug state
 changes during an active claim and rejects suspend/hibernate while a claim or
-quarantine exists.
+quarantine exists. The PM prepare notification also closes a transition gate
+before returning, so a new claim cannot race between the notifier check and
+userspace freezing.
 
 The module starts disarmed. `enabled=1` must be explicitly supplied and opening
 the device requires `CAP_SYS_RAWIO`. The device is mode `0600`.
@@ -57,8 +59,12 @@ the device requires `CAP_SYS_RAWIO`. The device is mode `0600`.
 `src/main.c` owns policy: discovering online ranges, ordering PFNs, waiting
 between attempts, repeating sweeps, recording outcomes, and containing faults.
 Each candidate is handled by a newly forked child. After opening and mapping the
-privileged device, the child clears supplementary groups, changes to the nobody
-UID/GID, sets `no_new_privs`, and requests the lowest practical CPU priority.
+privileged device, the child clears supplementary groups, changes to the
+dedicated `memwatcher` system account, sets `no_new_privs`, restores its
+parent-death signal, verifies that its parent is still present, and requests the
+lowest practical CPU priority. A successful device session is one-shot and
+every claim independently requires `CAP_SYS_RAWIO`, so the descriptor retained
+after the privilege drop cannot acquire another range.
 
 If the parent disappears, `PDEATHSIG` kills the child. If either process dies,
 the file-release path in the module notices an unfinished claim and retains the
@@ -94,9 +100,10 @@ IDLE (all freed)              IDLE (good freed, bad retained)
 CLAIMED/MAPPED -- crash, close, protocol failure --> whole block retained
 ```
 
-The kernel rejects completion while a mapping exists. Duplicate or out-of-range
-bad-page offsets reject the report and leave the claim owned by the session; a
-later close then invokes whole-claim quarantine.
+The kernel rejects completion while a mapping exists and rejects an ordinary
+test completion unless that session previously created a mapping. Duplicate or
+out-of-range bad-page offsets reject the report and leave the claim owned by the
+session; a later close then invokes whole-claim quarantine.
 
 ## Quarantine semantics
 
@@ -124,7 +131,9 @@ The ABI version is 2. A preload flag lets the kernel reject a supposed preload
 after any mapping occurred, and separate counters distinguish completed tests
 from restored known-bad pages. An incomplete-test flag prevents crash/error
 quarantine from inflating completed coverage. Kernel build assertions protect
-record sizes across 32- and 64-bit callers.
+record sizes across 32- and 64-bit callers. Sequential quarantine queries retain
+a per-session cursor, making complete enumeration linear while preserving the
+existing ioctl layout.
 
 ## Persistent quarantine
 
@@ -156,8 +165,10 @@ At a common 2 MiB pageblock size, 128 GiB contains 65,536 candidates; a ten-
 second interval yields a theoretical minimum sweep time of about 7.6 days, plus
 test and migration time. Failed acquisitions reduce actual coverage.
 
-Version 1 does not persist a sophisticated per-PFN priority database. Its ledger
-provides enough information to build one later. It also does not pressure Linux
+The ledger's last attempted PFN is a durable sweep cursor. On restart, the first
+pass resumes at the following candidate and wraps at the end, preventing frequent
+restarts from permanently starving high physical memory. This is not a
+sophisticated per-PFN priority database. Memwatcher also does not pressure Linux
 to evict unmovable pages, modify allocator internals, or reserve a tested pool.
 
 ## Prior art and deliberate departures

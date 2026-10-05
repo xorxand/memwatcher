@@ -26,13 +26,20 @@
 
 #include "../include/memwatcher_uapi.h"
 
+struct mw_quarantine;
+
 struct mw_session {
 	struct mutex lock;
 	unsigned long start_pfn;
 	unsigned long nr_pages;
+	struct mw_quarantine *query_q;
+	unsigned long query_bit;
+	u64 query_next_index;
 	atomic_t mappings;
 	bool claimed;
+	bool claim_used;
 	bool mapped_once;
+	bool query_valid;
 };
 
 struct mw_quarantine {
@@ -48,6 +55,7 @@ static DEFINE_MUTEX(mw_global_lock);
 static atomic_t mw_opened = ATOMIC_INIT(0);
 static unsigned long mw_active_claims;
 static bool mw_hotplug_busy;
+static bool mw_pm_busy;
 static bool mw_module_pinned;
 
 static atomic64_t mw_successful_claims;
@@ -224,6 +232,8 @@ static long mw_claim(struct mw_session *session, void __user *arg)
 
 	if (!enabled)
 		return -EPERM;
+	if (!capable(CAP_SYS_RAWIO))
+		return -EPERM;
 	if (copy_from_user(&request, arg, sizeof(request)))
 		return -EFAULT;
 	if (request.flags || request.start_pfn > ULONG_MAX)
@@ -233,13 +243,14 @@ static long mw_claim(struct mw_session *session, void __user *arg)
 	nr = request.nr_pages;
 
 	mutex_lock(&session->lock);
-	if (session->claimed || atomic_read(&session->mappings)) {
+	if (session->claimed || session->claim_used ||
+	    atomic_read(&session->mappings)) {
 		ret = -EBUSY;
 		goto out_session;
 	}
 
 	mutex_lock(&mw_global_lock);
-	if (mw_hotplug_busy) {
+	if (mw_hotplug_busy || mw_pm_busy) {
 		mutex_unlock(&mw_global_lock);
 		ret = -EBUSY;
 		goto out_session;
@@ -259,6 +270,7 @@ static long mw_claim(struct mw_session *session, void __user *arg)
 	session->start_pfn = start;
 	session->nr_pages = nr;
 	session->claimed = true;
+	session->claim_used = true;
 	session->mapped_once = false;
 	atomic64_inc(&mw_successful_claims);
 	mutex_unlock(&session->lock);
@@ -305,6 +317,7 @@ static long mw_complete(struct mw_session *session, void __user *arg)
 	if (result.flags & MW_RESULT_F_INCOMPLETE)
 		quarantine_flags |= MW_QUARANTINE_F_INCOMPLETE;
 	if ((count_as_preload && session->mapped_once) ||
+	    (!count_as_preload && !session->mapped_once) ||
 	    ((result.flags & MW_RESULT_F_INCOMPLETE) &&
 	     (!(result.flags & MW_RESULT_F_QUARANTINE_ALL) || count_as_preload))) {
 		ret = -EINVAL;
@@ -351,30 +364,56 @@ out:
 	return ret;
 }
 
-static long mw_get_quarantine(void __user *arg)
+static long mw_get_quarantine(struct mw_session *session, void __user *arg)
 {
 	struct mw_quarantine_query query;
 	struct mw_quarantine *q;
-	unsigned long index = 0, bit;
+	unsigned long index = 0, bit = 0;
 	bool found = false;
 
 	if (copy_from_user(&query, arg, sizeof(query)))
 		return -EFAULT;
 
+	mutex_lock(&session->lock);
 	mutex_lock(&mw_global_lock);
+	if (session->query_valid && query.index == session->query_next_index) {
+		q = session->query_q;
+		bit = session->query_bit;
+		while (q) {
+			bit = find_next_bit(q->bad, q->nr_pages, bit);
+			if (bit < q->nr_pages) {
+				found = true;
+				goto done;
+			}
+			if (list_is_last(&q->node, &mw_quarantines))
+				break;
+			q = list_next_entry(q, node);
+			bit = 0;
+		}
+	}
+
 	list_for_each_entry(q, &mw_quarantines, node) {
 		for_each_set_bit(bit, q->bad, q->nr_pages) {
 			if (index++ != query.index)
 				continue;
-			query.pfn = q->start_pfn + bit;
-			query.flags = q->flags;
-			query.reserved = 0;
 			found = true;
 			goto done;
 		}
 	}
 done:
+	if (found) {
+		query.pfn = q->start_pfn + bit;
+		query.flags = q->flags;
+		query.reserved = 0;
+		session->query_q = q;
+		session->query_bit = bit + 1;
+		session->query_next_index = query.index + 1;
+		session->query_valid = true;
+	} else {
+		session->query_valid = false;
+	}
 	mutex_unlock(&mw_global_lock);
+	mutex_unlock(&session->lock);
 	if (!found)
 		return -ENOENT;
 	return copy_to_user(arg, &query, sizeof(query)) ? -EFAULT : 0;
@@ -408,7 +447,7 @@ static long mw_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		mutex_unlock(&session->lock);
 		return ret;
 	case MW_IOC_GET_QUARANTINE:
-		return mw_get_quarantine(user_arg);
+		return mw_get_quarantine(session, user_arg);
 	default:
 		return -ENOTTY;
 	}
@@ -555,13 +594,24 @@ static int mw_pm_notify(struct notifier_block *nb,
 {
 	int ret = NOTIFY_OK;
 
-	if (action != PM_SUSPEND_PREPARE && action != PM_HIBERNATION_PREPARE &&
-	    action != PM_RESTORE_PREPARE)
-		return NOTIFY_OK;
-
 	mutex_lock(&mw_global_lock);
-	if (mw_active_claims || atomic64_read(&mw_quarantined_pages))
-		ret = notifier_from_errno(-EBUSY);
+	switch (action) {
+	case PM_SUSPEND_PREPARE:
+	case PM_HIBERNATION_PREPARE:
+	case PM_RESTORE_PREPARE:
+		if (mw_active_claims || atomic64_read(&mw_quarantined_pages))
+			ret = notifier_from_errno(-EBUSY);
+		else
+			mw_pm_busy = true;
+		break;
+	case PM_POST_SUSPEND:
+	case PM_POST_HIBERNATION:
+	case PM_POST_RESTORE:
+		mw_pm_busy = false;
+		break;
+	default:
+		break;
+	}
 	mutex_unlock(&mw_global_lock);
 	return ret;
 }
@@ -592,7 +642,7 @@ static int __init mw_init(void)
 	if (ret)
 		goto unregister_pm;
 
-	pr_info("memwatcher 1.1.0 loaded (enabled=%d, pageblock=%lu pages)\n",
+	pr_info("memwatcher 1.1.1 loaded (enabled=%d, pageblock=%lu pages)\n",
 		enabled, pageblock_nr_pages);
 	return 0;
 
@@ -617,4 +667,4 @@ module_exit(mw_exit);
 MODULE_AUTHOR("Memwatcher contributors");
 MODULE_DESCRIPTION("Continuous online physical memory test page isolator");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("1.1.0");
+MODULE_VERSION("1.1.1");
